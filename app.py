@@ -55,6 +55,8 @@ def get_token():
     else:
         print("Couldn't fetch a token, have you set up the App at developer.xero.com?")
         print(f"Status Code: {token_res.status_code}")
+        print(f"Response: {token_res.text}")
+        sys.exit(1)  # Exit if token retrieval fails
 
 
 def open_csv_file(column_name="InvoiceNumber"):
@@ -97,20 +99,40 @@ def process_void_job(token, invoice_ids, all_at_once):
     """
     We either void instantly or wait 1 second inbetween API calls using all_at_once
     """
-    if not all_at_once:
-        for idx in invoice_ids:
-            # Sleep 1.5 seconds so it's impossible to hit the rate limit
+    total_invoices = len(invoice_ids)
+    if total_invoices == 0:
+        print("No invoices to process.")
+        return
+
+    print(f"Starting to process {total_invoices} invoices.")
+
+    start_time = time.time()
+    processed = 0
+
+    for idx, invoice_id in enumerate(invoice_ids, start=1):
+        if not all_at_once:
+            # Sleep 1.5 seconds to respect rate limit
             # of 60 API calls max per minute
             time.sleep(1.5)
-            void_invoice(token, idx)
-        return
-    
-    for idx in invoice_ids:
-        void_invoice(token, idx)
-    return
+        # Calculate ETA before voiding to ensure accurate timing
+        elapsed_time = time.time() - start_time
+        if processed > 0:
+            average_time_per_call = elapsed_time / processed
+            remaining_calls = total_invoices - processed
+            eta_seconds = remaining_calls * average_time_per_call
+            eta_formatted = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
+        else:
+            eta_formatted = "Calculating..."
+
+        void_invoice(token, invoice_id, processed + 1, total_invoices, eta_formatted)
+        processed += 1
+
+    total_elapsed = time.time() - start_time
+    total_formatted = time.strftime("%H:%M:%S", time.gmtime(total_elapsed))
+    print(f"Completed processing {total_invoices} invoices in {total_formatted}.")
 
 
-def void_invoice(token, invoice_number):
+def void_invoice(token, invoice_number, processed, total, eta_formatted):
     """
     Voids a given invoice number
     """
@@ -128,12 +150,17 @@ def void_invoice(token, invoice_number):
     }
     void_res = post_xero_api_call(url, headers, data)
 
-    if void_res.status_code == 200:
-        print(f"Voided {invoice_number} successfully!")
+    if void_res.status_code in (200, 204):  # 204 No Content is also a success
+        print(f"Voided {invoice_number} successfully! ({processed}/{total}) ETA remaining: {eta_formatted}")
     else:
         print(f"Couldn't void {invoice_number}, please check there's no payments applied to it and that it still exists in Xero")
         print(f"Status Code: {void_res.status_code}")
-        print(void_res.json())
+        try:
+            response_content = void_res.json()
+            print(f"Response: {response_content}")
+        except json.JSONDecodeError:
+            print(f"Response Text: {void_res.text}")
+        print(f"Failed to void {invoice_number}. ({processed}/{total}) ETA remaining: {eta_formatted}")
 
 
 def main():
