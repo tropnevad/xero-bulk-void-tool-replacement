@@ -53,7 +53,29 @@ def get_token():
 
     if token_res.status_code == 200:
         print(f"Obtained token, it will expire in 30 minutes")
-        return token_res.json()['access_token']
+        token_data = token_res.json()
+        access_token = token_data['access_token']
+        
+        # Now get tenant information
+        tenants_url = "https://api.xero.com/connections"
+        tenants_headers = {
+            'Authorization': f"Bearer {access_token}"
+        }
+        tenants_res = requests.get(tenants_url, headers=tenants_headers)
+        
+        if tenants_res.status_code == 200:
+            tenants_data = tenants_res.json()
+            if tenants_data:
+                tenant_id = tenants_data[0].get('tenantId')
+                print(f"Found tenant ID: {tenant_id}")
+                return access_token, tenant_id
+            else:
+                print("No tenant information found")
+                sys.exit(1)
+        else:
+            print(f"Failed to get tenant information. Status Code: {tenants_res.status_code}")
+            print(f"Response: {tenants_res.text}")
+            sys.exit(1)
     else:
         print("Couldn't fetch a token, have you set up the App at developer.xero.com?")
         print(f"Status Code: {token_res.status_code}")
@@ -125,7 +147,7 @@ def put_xero_api_call(url, headers, data):
     return xero_res
 
 
-def process_void_job(token, invoice_ids, all_at_once):
+def process_void_job(token, tenant_id, invoice_ids, all_at_once):
     """
     We either void instantly or wait 1 second inbetween API calls using all_at_once
     """
@@ -154,7 +176,7 @@ def process_void_job(token, invoice_ids, all_at_once):
         else:
             eta_formatted = "Calculating..."
 
-        void_invoice(token, invoice_id, processed + 1, total_invoices, eta_formatted)
+        void_invoice(token, tenant_id, invoice_id, processed + 1, total_invoices, eta_formatted)
         processed += 1
 
     total_elapsed = time.time() - start_time
@@ -162,128 +184,137 @@ def process_void_job(token, invoice_ids, all_at_once):
     print(f"Completed processing {total_invoices} invoices in {total_formatted}.")
 
 
-def void_invoice(token, invoice_number, processed, total, eta_formatted):
+def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatted):
     """
     Voids a given invoice number
     """
-    print(f"Asking Xero to void {invoice_number}")
-
-    # First, try to find the invoice by its invoice number using Xero's filtering
-    import urllib.parse
-    encoded_invoice_number = urllib.parse.quote(invoice_number)
-    get_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}?where=InvoiceNumber=\"{encoded_invoice_number}\""
-    get_headers = {
-        'Accept': 'application/json',
-        'Authorization': f"Bearer {token}"
-    }
-    
-    # Get the specific invoice
-    get_res = requests.get(get_url, headers=get_headers)
-    
-    if get_res.status_code != 200:
-        print(f"Failed to retrieve invoice {invoice_number} from Xero. Status Code: {get_res.status_code}")
-        print(f"Response: {get_res.text}")
-        print(f"Skipping this invoice and continuing with others...")
-        return
-    
     try:
-        invoices_data = get_res.json()
-        invoice_id = None
+        print(f"Asking Xero to void {invoice_number}")
         
-        # Look for the specific invoice by invoice number
-        if 'Invoices' in invoices_data and len(invoices_data['Invoices']) > 0:
-            invoice_id = invoices_data['Invoices'][0].get('InvoiceID')
-            print(f"Found invoice {invoice_number} with ID {invoice_id}")
+        # 1) Find the invoice by number
+        import urllib.parse
+        encoded_invoice_number = urllib.parse.quote(invoice_number)
+        get_list_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}?where=InvoiceNumber==\"{encoded_invoice_number}\""
+        get_headers = {
+            'Accept': 'application/json',
+            'Authorization': f"Bearer {token}",
+            'xero-tenant-id': tenant_id
+        }
         
-        if not invoice_id:
-            print(f"Invoice {invoice_number} not found in Xero.")
+        list_res = requests.get(get_list_url, headers=get_headers)
+        if list_res.status_code != 200:
+            print(f"Failed to retrieve invoice list for {invoice_number}: {list_res.status_code}")
+            print(f"Response: {list_res.text}")
             print(f"Skipping this invoice and continuing with others...")
             return
-        
-        # Now void the invoice using its ID
-        # Get the full invoice details first
-        get_invoice_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}/{invoice_id}"
-        get_invoice_res = requests.get(get_invoice_url, headers=get_headers)
-        
-        if get_invoice_res.status_code != 200:
-            print(f"Failed to retrieve full invoice details. Status Code: {get_invoice_res.status_code}")
-            print(f"Response: {get_invoice_res.text}")
+
+        data = list_res.json()
+        if not data.get('Invoices'):
+            print(f"No invoice found with number {invoice_number}")
             print(f"Skipping this invoice and continuing with others...")
             return
+
+        invoice_id = data['Invoices'][0]['InvoiceID']
+        print(f"Found invoice {invoice_number} with ID {invoice_id}")
+
+        # 2) Fetch full invoice details
+        get_full_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}/{invoice_id}"
+        full_res = requests.get(get_full_url, headers=get_headers)
+        if full_res.status_code != 200:
+            print(f"Failed to retrieve full details for {invoice_number}: {full_res.status_code}")
+            print(f"Response: {full_res.text}")
+            print(f"Skipping this invoice and continuing with others...")
+            return
+
+        invoice = full_res.json()['Invoices'][0]
+        current_status = invoice.get('Status', 'UNKNOWN')
+        print(f"Current status of {invoice_number}: {current_status}")
+
+        if current_status == 'VOIDED':
+            print(f"{invoice_number} already voided; skipping.")
+            return
+
+        # 3) Void via update endpoint
+        # Use the exact invoice data from the API response to avoid rounding errors
+        void_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}"
+        void_headers = {
+            'Accept': 'application/json',
+            'Authorization': f"Bearer {token}",
+            'xero-tenant-id': tenant_id,
+            'Content-Type': 'application/json'
+        }
         
-        try:
-            full_invoice_data = get_invoice_res.json()
-            if 'Invoices' in full_invoice_data and len(full_invoice_data['Invoices']) > 0:
-                # Check the current status
-                current_status = full_invoice_data['Invoices'][0].get('Status', 'UNKNOWN')
-                print(f"Invoice {invoice_number} current status: {current_status}")
+        # Generate a unique idempotency key for this request
+        import uuid
+        idempotency_key = str(uuid.uuid4())
+        void_headers['Idempotency-Key'] = idempotency_key
+        
+        # Create void payload using the exact invoice data to avoid rounding errors
+        void_invoice_data = {
+            "InvoiceID": invoice_id,
+            "Status": "VOIDED"
+        }
+        
+        # Add other required fields from the original invoice to maintain consistency
+        if 'Type' in invoice:
+            void_invoice_data['Type'] = invoice['Type']
+        if 'Contact' in invoice:
+            void_invoice_data['Contact'] = invoice['Contact']
+        if 'Date' in invoice:
+            void_invoice_data['Date'] = invoice['Date']
+        if 'DueDate' in invoice:
+            void_invoice_data['DueDate'] = invoice['DueDate']
+        if 'LineAmountTypes' in invoice:
+            void_invoice_data['LineAmountTypes'] = invoice['LineAmountTypes']
+        if 'LineItems' in invoice:
+            void_invoice_data['LineItems'] = invoice['LineItems']
+        
+        void_payload = {
+            "Invoices": [void_invoice_data]
+        }
+        
+        void_res = post_xero_api_call(void_url, void_headers, void_payload)
+        if void_res.status_code in (200, 204):
+            print(f"Voided {invoice_number} successfully! ({processed}/{total}) ETA remaining: {eta_formatted}")
+        else:
+            print(f"Failed to void {invoice_number}: {void_res.status_code}")
+            print(f"Response: {void_res.text}")
+            
+            # Try to parse the response for validation errors
+            try:
+                error_response = void_res.json()
+                has_validation_errors = False
+                has_minor_rounding_error = False
                 
-                # Check if invoice is already voided
-                if current_status == 'VOIDED':
-                    print(f"Invoice {invoice_number} is already voided. No action needed.")
-                    return
-                
-                # According to Xero API documentation, to void an invoice we need to add a history record
-                # with the status change, not update the invoice directly
-                url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}/{invoice_id}/history"
-                headers = {
-                    'Accept': 'application/json',
-                    'Authorization': f"Bearer {token}",
-                    'Content-Type': 'application/json'
-                }
-                data = {
-                    "HistoryRecords": [
-                        {
-                            "Details": "Voided via API"
-                        }
-                    ],
-                    "Status": "VOIDED"
-                }
-                
-                # Use POST to add a history record that voids the invoice
-                void_res = post_xero_api_call(url, headers, data)
-                
-                # Check if we have a response from the voiding attempt
-                if void_res.status_code in (200, 204):  # 204 No Content is also a success
-                    print(f"Voided {invoice_number} successfully! ({processed}/{total}) ETA remaining: {eta_formatted}")
-                else:
-                    print(f"Couldn't void {invoice_number} on first attempt, checking for validation errors...")
-                    print(f"Status Code: {void_res.status_code}")
-                    has_minor_rounding_error = False
-                    try:
-                        response_content = void_res.json()
-                        print(f"Response: {response_content}")
+                # Check for validation errors in the top level
+                if 'ValidationErrors' in error_response:
+                    has_validation_errors = True
+                    for error in error_response['ValidationErrors']:
+                        print(f"Validation Error: {error['Message']}")
                         
-                        # Check for validation errors
-                        has_validation_error = False
-                        if 'Elements' in response_content and len(response_content['Elements']) > 0:
-                            element = response_content['Elements'][0]
-                            if 'ValidationErrors' in element:
-                                has_validation_error = True
-                                for error in element['ValidationErrors']:
-                                    print(f"Validation Error: {error['Message']}")
-                                    
-                                    # Handle line total mismatch errors specifically
-                                    if 'line total' in error['Message'].lower():
-                                        # Extract numeric values from error message
-                                        import re
-                                        numbers = re.findall(r'\d+\.\d+', error['Message'])
-                                        if len(numbers) >= 2:
-                                            actual = float(numbers[0])
-                                            expected = float(numbers[1])
-                                            
-                                            # Check if difference is within tolerance (penny/cent difference)
-                                            if math.isclose(actual, expected, abs_tol=0.01):
-                                                print(f"NOTE: This is a minor floating-point precision issue (difference: {abs(actual-expected):.4f}).")
-                                                print(f"This invoice is in your CSV and should be voided despite the minor rounding error.")
-                                                has_minor_rounding_error = True
-                
-                        # Handle top-level validation errors
-                        elif 'ValidationErrors' in response_content:
-                            has_validation_error = True
-                            for error in response_content['ValidationErrors']:
-                                print(f"Validation Error: {error['Message']}")
+                        # Handle line total mismatch errors specifically
+                        if 'line total' in error['Message'].lower():
+                            # Extract numeric values from error message
+                            import re
+                            numbers = re.findall(r'\d+\.\d+', error['Message'])
+                            if len(numbers) >= 2:
+                                actual = float(numbers[0])
+                                expected = float(numbers[1])
+                                difference = abs(actual - expected)
                                 
+                                # Check if difference is within tolerance (penny/cent difference)
+                                if difference <= 0.02:  # Allow up to 2 pence/cents difference
+                                    print(f"NOTE: This is a minor floating-point precision issue (difference: {difference:.4f}).")
+                                    print(f"This is a known issue with Xero's API and floating-point arithmetic.")
+                                    has_minor_rounding_error = True
+                
+                # Check for validation errors in Elements
+                if 'Elements' in error_response and len(error_response['Elements']) > 0:
+                    for element in error_response['Elements']:
+                        if 'ValidationErrors' in element:
+                            has_validation_errors = True
+                            for error in element['ValidationErrors']:
+                                print(f"Validation Error: {error['Message']}")
                                 # Handle line total mismatch errors specifically
                                 if 'line total' in error['Message'].lower():
                                     # Extract numeric values from error message
@@ -292,73 +323,89 @@ def void_invoice(token, invoice_number, processed, total, eta_formatted):
                                     if len(numbers) >= 2:
                                         actual = float(numbers[0])
                                         expected = float(numbers[1])
-                                        
+                                        difference = abs(actual - expected)
                                         # Check if difference is within tolerance (penny/cent difference)
-                                        if math.isclose(actual, expected, abs_tol=0.01):
-                                            print(f"NOTE: This is a minor floating-point precision issue (difference: {abs(actual-expected):.4f}).")
-                                            print(f"This invoice is in your CSV and should be voided despite the minor rounding error.")
+                                        if difference <= 0.02:  # Allow up to 2 pence/cents difference
+                                            print(f"NOTE: This is a minor floating-point precision issue (difference: {difference:.4f}).")
+                                            print(f"This is a known issue with Xero's API and floating-point arithmetic.")
                                             has_minor_rounding_error = True
-                
-                        # If we have a minor rounding error, we should still try to void the invoice
-                        # as the error might be preventing the voiding from completing
-                        if has_minor_rounding_error:
-                            print(f"NOTE: This is a minor floating-point precision issue.")
-                            print(f"The invoice may still be in its original state in Xero.")
-                            print(f"Please check the invoice manually in Xero and void it if needed.")
-                            return
-                        
-                        # If we have validation errors, the voiding attempt failed
-                        # regardless of what the status field says
-                        if has_validation_error:
-                            print(f"This invoice has validation errors that prevent voiding.")
-                            print(f"The invoice may still be in its original state in Xero.")
-                            print(f"Please check the invoice manually in Xero.")
-                            print(f"Skipping this invoice and continuing with others...")
-                            return
-                            
-                    except json.JSONDecodeError:
-                        print(f"Response Text: {void_res.text}")
-                    except Exception as e:
-                        print(f"Error processing response: {str(e)}")
-                    print(f"Failed to void {invoice_number}. ({processed}/{total}) ETA remaining: {eta_formatted}")
-            else:
-                print(f"Failed to retrieve full invoice details for {invoice_number}.")
-                print(f"Skipping this invoice and continuing with others...")
-                return
-        except Exception as e:
-            print(f"Error processing full invoice data for {invoice_number}: {str(e)}")
-            print(f"Skipping this invoice and continuing with others...")
-            return
-    except Exception as e:
-        print(f"Error processing invoice {invoice_number}: {str(e)}")
-        print(f"Skipping this invoice and continuing with others...")
-        return
 
+                # Provide appropriate guidance based on error analysis
+                if has_validation_errors:
+                    if has_minor_rounding_error:
+                        print(f"IMPORTANT: This invoice ({invoice_number}) appears to have minor rounding errors that prevent automatic voiding.")
+                        print(f"Please void this invoice manually in Xero as it is still in your CSV file.")
+                        print(f"The invoice ID is: {invoice_id}")
+                    else:
+                        # Check if this might be a rounding error we missed
+                        is_potential_rounding_error = False
+                        if 'Elements' in error_response and len(error_response['Elements']) > 0:
+                            for element in error_response['Elements']:
+                                if 'ValidationErrors' in element:
+                                    for error in element['ValidationErrors']:
+                                        if 'line total' in error['Message'].lower():
+                                            # Extract numeric values from error message
+                                            import re
+                                            numbers = re.findall(r'\d+\.\d+', error['Message'])
+                                            if len(numbers) >= 2:
+                                                actual = float(numbers[0])
+                                                expected = float(numbers[1])
+                                                difference = abs(actual - expected)
+                                                
+                                                # Check if difference is within tolerance (accept voids within ±0.05)
+                                                if difference <= 0.05:
+                                                    is_potential_rounding_error = True
+                        if is_potential_rounding_error:
+                            print(f"IMPORTANT: This invoice ({invoice_number}) appears to have minor rounding errors that prevent automatic voiding.")
+                            print(f"Please void this invoice manually in Xero as it is still in your CSV file.")
+                            print(f"The invoice ID is: {invoice_id}")
+                        else:
+                            print(f"This invoice has validation errors that are not related to rounding issues.")
+                            print(f"Please check the invoice manually in Xero.")
+                else:
+                    print(f"No validation errors found in response, but voiding still failed.")
+                    print(f"Please check the invoice manually in Xero.")
+            except Exception as e:
+                print(f"Error processing response: {str(e)}")
+                print(f"Response text: {void_res.text}")
+            print(f"Failed to void {invoice_number}. ({processed}/{total}) ETA remaining: {eta_formatted}")
+    except requests.exceptions.RequestException as e:
+        print(f"Network error processing invoice {invoice_number}: {str(e)}")
+        print(f"Skipping {invoice_number} and continuing with the next invoice.")
+        return
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error processing invoice {invoice_number}: {str(e)}")
+        print(f"Skipping {invoice_number} and continuing with the next invoice.")
+        return
+    except Exception as e:
+        print(f"Unexpected error processing invoice {invoice_number}: {str(e)}")
+        print(f"Skipping {invoice_number} and continuing with the next invoice.")
+        return
 
 def main():
     """
     Main execution loop
     """
     try:
-        # Request access token from Xero
+        # Get token from Xero
         print("Asking Xero for an Access Token...")
-        token = get_token()
-
-        # Find all CSV files in the folder
+        token, tenant_id = get_token()
+        
+        # Find all CSV files in the current directory
         csv_files = find_csv_files()
-        all_invoice_ids = set()
-
+        all_invoice_ids = set()  # Use a set to avoid duplicates
+        
         # Read invoice numbers from all found CSV files
         for csv_file in csv_files:
             print(f"\nReading from {csv_file}...")
             invoice_ids_from_file = read_invoice_numbers_from_csv(csv_file)
             if invoice_ids_from_file:
                 all_invoice_ids.update(invoice_ids_from_file)
-
+        
         if not all_invoice_ids:
             print("No invoice numbers found in any of the CSV files. Exiting.")
             sys.exit(0)
-
+        
         # Safety mechanism for those wanting to check before committing
         if DRY_RUN == "Enabled":
             print("Dry run is enabled, not voiding anything")
@@ -366,10 +413,10 @@ def main():
         else:
             if len(all_invoice_ids) > 60:
                 print("Warning: The Xero API limit is 60 calls per minute. We will void one per second.")
-                process_void_job(token, all_invoice_ids, all_at_once=False)
+                process_void_job(token, tenant_id, all_invoice_ids, all_at_once=False)
             else:
                 print("Warning: The Xero API limit is 60 calls per minute. You are voiding less than 60 so we will blast through them.")
-                process_void_job(token, all_invoice_ids, all_at_once=True)
+                process_void_job(token, tenant_id, all_invoice_ids, all_at_once=True)
     except Exception as err:
         print(f"Encountered an error: {str(err)}")
 
