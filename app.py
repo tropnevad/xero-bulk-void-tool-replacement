@@ -6,7 +6,7 @@ import requests
 import sys
 import time
 import os
-
+import urllib.parse
 from requests.auth import HTTPBasicAuth
 
 
@@ -113,6 +113,17 @@ def post_xero_api_call(url, headers, data, auth=False):
         )
     return xero_res
 
+def put_xero_api_call(url, headers, data):
+    """
+    Send a put request to Xero for updating existing resources
+    """
+    xero_res = requests.put(
+        url, 
+        headers=headers, 
+        data=json.dumps(data)
+    )
+    return xero_res
+
 
 def process_void_job(token, invoice_ids, all_at_once):
     """
@@ -157,102 +168,171 @@ def void_invoice(token, invoice_number, processed, total, eta_formatted):
     """
     print(f"Asking Xero to void {invoice_number}")
 
-    url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}/{invoice_number}"
-    headers = {
+    # First, try to find the invoice by its invoice number using Xero's filtering
+    import urllib.parse
+    encoded_invoice_number = urllib.parse.quote(invoice_number)
+    get_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}?where=InvoiceNumber=\"{encoded_invoice_number}\""
+    get_headers = {
         'Accept': 'application/json',
-        'Authorization': f"Bearer {token}",
-        'Content-Type': 'application/json'
+        'Authorization': f"Bearer {token}"
     }
-    data = {
-        "InvoiceNumber": invoice_number,
-        "Status": "VOIDED"
-    }
-    void_res = post_xero_api_call(url, headers, data)
-
-    if void_res.status_code in (200, 204):  # 204 No Content is also a success
-        print(f"Voided {invoice_number} successfully! ({processed}/{total}) ETA remaining: {eta_formatted}")
-    else:
-        print(f"Couldn't void {invoice_number} on first attempt, checking for validation errors...")
-        print(f"Status Code: {void_res.status_code}")
-        has_minor_rounding_error = False
+    
+    # Get the specific invoice
+    get_res = requests.get(get_url, headers=get_headers)
+    
+    if get_res.status_code != 200:
+        print(f"Failed to retrieve invoice {invoice_number} from Xero. Status Code: {get_res.status_code}")
+        print(f"Response: {get_res.text}")
+        print(f"Skipping this invoice and continuing with others...")
+        return
+    
+    try:
+        invoices_data = get_res.json()
+        invoice_id = None
+        
+        # Look for the specific invoice by invoice number
+        if 'Invoices' in invoices_data and len(invoices_data['Invoices']) > 0:
+            invoice_id = invoices_data['Invoices'][0].get('InvoiceID')
+            print(f"Found invoice {invoice_number} with ID {invoice_id}")
+        
+        if not invoice_id:
+            print(f"Invoice {invoice_number} not found in Xero.")
+            print(f"Skipping this invoice and continuing with others...")
+            return
+        
+        # Now void the invoice using its ID
+        # Get the full invoice details first
+        get_invoice_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}/{invoice_id}"
+        get_invoice_res = requests.get(get_invoice_url, headers=get_headers)
+        
+        if get_invoice_res.status_code != 200:
+            print(f"Failed to retrieve full invoice details. Status Code: {get_invoice_res.status_code}")
+            print(f"Response: {get_invoice_res.text}")
+            print(f"Skipping this invoice and continuing with others...")
+            return
+        
         try:
-            response_content = void_res.json()
-            print(f"Response: {response_content}")
-            
-            # Check for validation errors
-            has_validation_error = False
-            if 'Elements' in response_content and len(response_content['Elements']) > 0:
-                element = response_content['Elements'][0]
-                if 'ValidationErrors' in element:
-                    has_validation_error = True
-                    for error in element['ValidationErrors']:
-                        print(f"Validation Error: {error['Message']}")
+            full_invoice_data = get_invoice_res.json()
+            if 'Invoices' in full_invoice_data and len(full_invoice_data['Invoices']) > 0:
+                # Check the current status
+                current_status = full_invoice_data['Invoices'][0].get('Status', 'UNKNOWN')
+                print(f"Invoice {invoice_number} current status: {current_status}")
+                
+                # Check if invoice is already voided
+                if current_status == 'VOIDED':
+                    print(f"Invoice {invoice_number} is already voided. No action needed.")
+                    return
+                
+                # According to Xero API documentation, to void an invoice we need to add a history record
+                # with the status change, not update the invoice directly
+                url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}/{invoice_id}/history"
+                headers = {
+                    'Accept': 'application/json',
+                    'Authorization': f"Bearer {token}",
+                    'Content-Type': 'application/json'
+                }
+                data = {
+                    "HistoryRecords": [
+                        {
+                            "Details": "Voided via API"
+                        }
+                    ],
+                    "Status": "VOIDED"
+                }
+                
+                # Use POST to add a history record that voids the invoice
+                void_res = post_xero_api_call(url, headers, data)
+                
+                # Check if we have a response from the voiding attempt
+                if void_res.status_code in (200, 204):  # 204 No Content is also a success
+                    print(f"Voided {invoice_number} successfully! ({processed}/{total}) ETA remaining: {eta_formatted}")
+                else:
+                    print(f"Couldn't void {invoice_number} on first attempt, checking for validation errors...")
+                    print(f"Status Code: {void_res.status_code}")
+                    has_minor_rounding_error = False
+                    try:
+                        response_content = void_res.json()
+                        print(f"Response: {response_content}")
                         
-                        # Handle line total mismatch errors specifically
-                        if 'line total' in error['Message'].lower():
-                            # Extract numeric values from error message
-                            import re
-                            numbers = re.findall(r'\d+\.\d+', error['Message'])
-                            if len(numbers) >= 2:
-                                actual = float(numbers[0])
-                                expected = float(numbers[1])
+                        # Check for validation errors
+                        has_validation_error = False
+                        if 'Elements' in response_content and len(response_content['Elements']) > 0:
+                            element = response_content['Elements'][0]
+                            if 'ValidationErrors' in element:
+                                has_validation_error = True
+                                for error in element['ValidationErrors']:
+                                    print(f"Validation Error: {error['Message']}")
+                                    
+                                    # Handle line total mismatch errors specifically
+                                    if 'line total' in error['Message'].lower():
+                                        # Extract numeric values from error message
+                                        import re
+                                        numbers = re.findall(r'\d+\.\d+', error['Message'])
+                                        if len(numbers) >= 2:
+                                            actual = float(numbers[0])
+                                            expected = float(numbers[1])
+                                            
+                                            # Check if difference is within tolerance (penny/cent difference)
+                                            if math.isclose(actual, expected, abs_tol=0.01):
+                                                print(f"NOTE: This is a minor floating-point precision issue (difference: {abs(actual-expected):.4f}).")
+                                                print(f"This invoice is in your CSV and should be voided despite the minor rounding error.")
+                                                has_minor_rounding_error = True
+                
+                        # Handle top-level validation errors
+                        elif 'ValidationErrors' in response_content:
+                            has_validation_error = True
+                            for error in response_content['ValidationErrors']:
+                                print(f"Validation Error: {error['Message']}")
                                 
-                                # Check if difference is within tolerance (penny/cent difference)
-                                if math.isclose(actual, expected, abs_tol=0.01):
-                                    print(f"NOTE: This is a minor floating-point precision issue (difference: {abs(actual-expected):.4f}).")
-                                    print(f"This invoice is in your CSV and should be voided despite the minor rounding error.")
-                                    has_minor_rounding_error = True
-            
-            # Handle top-level validation errors
-            elif 'ValidationErrors' in response_content:
-                has_validation_error = True
-                for error in response_content['ValidationErrors']:
-                    print(f"Validation Error: {error['Message']}")
-                    
-                    # Handle line total mismatch errors specifically
-                    if 'line total' in error['Message'].lower():
-                        # Extract numeric values from error message
-                        import re
-                        numbers = re.findall(r'\d+\.\d+', error['Message'])
-                        if len(numbers) >= 2:
-                            actual = float(numbers[0])
-                            expected = float(numbers[1])
+                                # Handle line total mismatch errors specifically
+                                if 'line total' in error['Message'].lower():
+                                    # Extract numeric values from error message
+                                    import re
+                                    numbers = re.findall(r'\d+\.\d+', error['Message'])
+                                    if len(numbers) >= 2:
+                                        actual = float(numbers[0])
+                                        expected = float(numbers[1])
+                                        
+                                        # Check if difference is within tolerance (penny/cent difference)
+                                        if math.isclose(actual, expected, abs_tol=0.01):
+                                            print(f"NOTE: This is a minor floating-point precision issue (difference: {abs(actual-expected):.4f}).")
+                                            print(f"This invoice is in your CSV and should be voided despite the minor rounding error.")
+                                            has_minor_rounding_error = True
+                
+                        # If we have a minor rounding error, we should still try to void the invoice
+                        # as the error might be preventing the voiding from completing
+                        if has_minor_rounding_error:
+                            print(f"NOTE: This is a minor floating-point precision issue.")
+                            print(f"The invoice may still be in its original state in Xero.")
+                            print(f"Please check the invoice manually in Xero and void it if needed.")
+                            return
+                        
+                        # If we have validation errors, the voiding attempt failed
+                        # regardless of what the status field says
+                        if has_validation_error:
+                            print(f"This invoice has validation errors that prevent voiding.")
+                            print(f"The invoice may still be in its original state in Xero.")
+                            print(f"Please check the invoice manually in Xero.")
+                            print(f"Skipping this invoice and continuing with others...")
+                            return
                             
-                            # Check if difference is within tolerance (penny/cent difference)
-                            if math.isclose(actual, expected, abs_tol=0.01):
-                                print(f"NOTE: This is a minor floating-point precision issue (difference: {abs(actual-expected):.4f}).")
-                                print(f"This invoice is in your CSV and should be voided despite the minor rounding error.")
-                                has_minor_rounding_error = True
-            
-            # If we have a minor rounding error, we'll consider it successfully voided
-            if has_minor_rounding_error:
-                print(f"Voided {invoice_number} successfully (minor rounding error ignored)! ({processed}/{total}) ETA remaining: {eta_formatted}")
-                return
-            
-            # If we have validation errors but they're not line total issues
-            elif has_validation_error:
-                # Check if the invoice is already voided
-                if 'Elements' in response_content and len(response_content['Elements']) > 0:
-                    element = response_content['Elements'][0]
-                    if 'Status' in element and element['Status'] == 'VOIDED':
-                        print(f"NOTE: Invoice {invoice_number} is already voided in Xero. No action needed.")
-                        print(f"Successfully processed (already voided)! ({processed}/{total}) ETA remaining: {eta_formatted}")
-                        return
-                    elif 'ValidationErrors' in element:
-                        for error in element['ValidationErrors']:
-                            if 'not of valid status for modification' in error['Message'].lower():
-                                print(f"NOTE: Invoice {invoice_number} cannot be modified because it's already in the desired state.")
-                                print(f"Successfully processed (already voided)! ({processed}/{total}) ETA remaining: {eta_formatted}")
-                                return
-                print(f"This invoice has validation errors that prevent voiding.")
+                    except json.JSONDecodeError:
+                        print(f"Response Text: {void_res.text}")
+                    except Exception as e:
+                        print(f"Error processing response: {str(e)}")
+                    print(f"Failed to void {invoice_number}. ({processed}/{total}) ETA remaining: {eta_formatted}")
+            else:
+                print(f"Failed to retrieve full invoice details for {invoice_number}.")
                 print(f"Skipping this invoice and continuing with others...")
                 return
-                        
-        except json.JSONDecodeError:
-            print(f"Response Text: {void_res.text}")
         except Exception as e:
-            print(f"Error processing response: {str(e)}")
-        print(f"Failed to void {invoice_number}. ({processed}/{total}) ETA remaining: {eta_formatted}")
+            print(f"Error processing full invoice data for {invoice_number}: {str(e)}")
+            print(f"Skipping this invoice and continuing with others...")
+            return
+    except Exception as e:
+        print(f"Error processing invoice {invoice_number}: {str(e)}")
+        print(f"Skipping this invoice and continuing with others...")
+        return
 
 
 def main():
