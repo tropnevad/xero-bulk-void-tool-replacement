@@ -147,9 +147,10 @@ def put_xero_api_call(url, headers, data):
     return xero_res
 
 
-def process_void_job(token, tenant_id, invoice_ids, all_at_once):
+def process_void_job(invoice_ids, all_at_once):
     """
     We either void instantly or use adaptive rate limiting with all_at_once
+    Includes automatic token refresh for long-running tasks
     """
     total_invoices = len(invoice_ids)
     if total_invoices == 0:
@@ -167,6 +168,8 @@ def process_void_job(token, tenant_id, invoice_ids, all_at_once):
     # Performance tracking variables
     fast_voids = 0
     retry_voids = 0
+    # Token refresh tracking
+    token_refreshes = 0
 
     for idx, invoice_id in enumerate(invoice_ids, start=1):
         if not all_at_once:
@@ -182,7 +185,18 @@ def process_void_job(token, tenant_id, invoice_ids, all_at_once):
         else:
             eta_formatted = "Calculating..."
 
-        rate_limited = void_invoice(token, tenant_id, invoice_id, processed + 1, total_invoices, eta_formatted)
+        # Handle token refresh and void invoice
+        result = void_invoice(invoice_id, processed + 1, total_invoices, eta_formatted)
+        
+        # Check if token was refreshed and we need to retry
+        if result == 'token_refreshed':
+            # Refresh token and retry the same invoice
+            refresh_token()
+            print(f"Retrying {invoice_id} with refreshed token...")
+            result = void_invoice(invoice_id, processed + 1, total_invoices, eta_formatted)
+            token_refreshes += 1
+        
+        rate_limited = (result == True)
         processed += 1
         
         # Track performance based on return value pattern
@@ -205,13 +219,52 @@ def process_void_job(token, tenant_id, invoice_ids, all_at_once):
     total_formatted = time.strftime("%H:%M:%S", time.gmtime(total_elapsed))
     rate_limit_info = f" (hit rate limit {rate_limit_hits} times)" if rate_limit_hits > 0 else ""
     performance_info = f" | Fast voids: {fast_voids}, Retry voids: {retry_voids}" if (fast_voids > 0 or retry_voids > 0) else ""
+    token_info = f" | Token refreshes: {token_refreshes}" if token_refreshes > 0 else ""
     api_calls_saved = fast_voids * 2  # Each fast void saves 2 API calls
     if api_calls_saved > 0:
         performance_info += f" (Saved {api_calls_saved} API calls!)"
-    print(f"Completed processing {total_invoices} invoices in {total_formatted}{rate_limit_info}{performance_info}.")
+    print(f"Completed processing {total_invoices} invoices in {total_formatted}{rate_limit_info}{performance_info}{token_info}.")
 
 
-def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatted):
+# Global token variables for refresh management
+global_token = None
+global_tenant_id = None
+
+
+def refresh_token():
+    """
+    Refreshes the global Xero token and tenant_id
+    """
+    global global_token, global_tenant_id
+    print("🔄 Token expired, refreshing...")
+    global_token, global_tenant_id = get_token()
+    print(f"✅ Token refreshed successfully!")
+    return global_token, global_tenant_id
+
+
+def handle_api_response(response, invoice_number, operation):
+    """
+    Handles API response, checking for token expiration and other errors
+    Returns: 'rate_limit', 'token_expired', 'success', 'error'
+    """
+    if response.status_code == 429:
+        print(f"Rate limit exceeded while {operation} for {invoice_number}")
+        return 'rate_limit'
+    elif response.status_code == 401:
+        error_detail = response.json().get('Detail', '')
+        if 'TokenExpired' in error_detail:
+            print(f"🔄 Token expired while {operation} for {invoice_number}")
+            return 'token_expired'
+        else:
+            print(f"Unauthorized error while {operation} for {invoice_number}: {response.text}")
+            return 'error'
+    elif response.status_code in (200, 204):
+        return 'success'
+    else:
+        return 'error'
+
+
+def void_invoice(invoice_number, processed, total, eta_formatted):
     """
     Voids a given invoice number using optimized approach:
     1. Try direct void first (fast path)
@@ -229,15 +282,18 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
         get_list_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}?where=InvoiceNumber==\"{encoded_invoice_number}\""
         get_headers = {
             'Accept': 'application/json',
-            'Authorization': f"Bearer {token}",
-            'xero-tenant-id': tenant_id
+            'Authorization': f"Bearer {global_token}",
+            'xero-tenant-id': global_tenant_id
         }
         
         list_res = requests.get(get_list_url, headers=get_headers)
-        if list_res.status_code == 429:
-            print(f"Rate limit exceeded while searching for {invoice_number}")
+        response_type = handle_api_response(list_res, invoice_number, "searching")
+        
+        if response_type == 'rate_limit':
             return True  # Signal rate limit hit
-        elif list_res.status_code != 200:
+        elif response_type == 'token_expired':
+            return 'token_refreshed'  # Signal token refresh needed
+        elif response_type == 'error':
             print(f"Failed to retrieve invoice list for {invoice_number}: {list_res.status_code}")
             print(f"Response: {list_res.text}")
             print(f"Skipping this invoice and continuing with others...")
@@ -257,8 +313,8 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
         void_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}"
         void_headers = {
             'Accept': 'application/json',
-            'Authorization': f"Bearer {token}",
-            'xero-tenant-id': tenant_id,
+            'Authorization': f"Bearer {global_token}",
+            'xero-tenant-id': global_tenant_id,
             'Content-Type': 'application/json'
         }
         
@@ -271,10 +327,13 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
         }
         
         void_res = post_xero_api_call(void_url, void_headers, fast_void_payload)
-        if void_res.status_code == 429:
-            print(f"Rate limit exceeded while voiding {invoice_number}")
+        response_type = handle_api_response(void_res, invoice_number, "voiding")
+        
+        if response_type == 'rate_limit':
             return True  # Signal rate limit hit
-        elif void_res.status_code in (200, 204):
+        elif response_type == 'token_expired':
+            return 'token_refreshed'  # Signal token refresh needed
+        elif response_type == 'success':
             print(f"✓ Fast void successful! {invoice_number} voided. ({processed}/{total}) ETA remaining: {eta_formatted}")
             void_invoice.last_result = 'fast_success'
             return False  # Success, no rate limit
@@ -286,10 +345,13 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
         # 3) Fetch full invoice details for retry
         get_full_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}/{invoice_id}"
         full_res = requests.get(get_full_url, headers=get_headers)
-        if full_res.status_code == 429:
-            print(f"Rate limit exceeded while fetching details for {invoice_number}")
+        response_type = handle_api_response(full_res, invoice_number, "fetching details")
+        
+        if response_type == 'rate_limit':
             return True  # Signal rate limit hit
-        elif full_res.status_code != 200:
+        elif response_type == 'token_expired':
+            return 'token_refreshed'  # Signal token refresh needed
+        elif response_type == 'error':
             print(f"Failed to retrieve full details for {invoice_number}: {full_res.status_code}")
             print(f"Response: {full_res.text}")
             print(f"Skipping this invoice and continuing with others...")
@@ -309,8 +371,8 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
         void_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}"
         void_headers = {
             'Accept': 'application/json',
-            'Authorization': f"Bearer {token}",
-            'xero-tenant-id': tenant_id,
+            'Authorization': f"Bearer {global_token}",
+            'xero-tenant-id': global_tenant_id,
             'Content-Type': 'application/json'
         }
         
@@ -344,10 +406,13 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
         }
         
         void_res = post_xero_api_call(void_url, void_headers, void_payload)
-        if void_res.status_code == 429:
-            print(f"Rate limit exceeded while voiding {invoice_number}")
+        response_type = handle_api_response(void_res, invoice_number, "retry voiding")
+        
+        if response_type == 'rate_limit':
             return True  # Signal rate limit hit
-        elif void_res.status_code in (200, 204):
+        elif response_type == 'token_expired':
+            return 'token_refreshed'  # Signal token refresh needed
+        elif response_type == 'success':
             print(f"✓ Retry void successful! {invoice_number} voided with complete data. ({processed}/{total}) ETA remaining: {eta_formatted}")
             void_invoice.last_result = 'retry_success'
             return False  # Success, no rate limit
@@ -463,9 +528,10 @@ def main():
     Main execution loop
     """
     try:
-        # Get token from Xero
+        # Get token from Xero and set global variables
         print("Asking Xero for an Access Token...")
-        token, tenant_id = get_token()
+        global global_token, global_tenant_id
+        global_token, global_tenant_id = get_token()
         
         # Find all CSV files in the current directory
         csv_files = find_csv_files()
@@ -489,10 +555,10 @@ def main():
         else:
             if len(all_invoice_ids) > 60:
                 print("Warning: The Xero API limit is 60 calls per minute. We will void one per second.")
-                process_void_job(token, tenant_id, all_invoice_ids, all_at_once=False)
+                process_void_job(all_invoice_ids, all_at_once=False)
             else:
                 print("Warning: The Xero API limit is 60 calls per minute. You are voiding less than 60 so we will blast through them.")
-                process_void_job(token, tenant_id, all_invoice_ids, all_at_once=True)
+                process_void_job(all_invoice_ids, all_at_once=True)
     except Exception as err:
         print(f"Encountered an error: {str(err)}")
 
