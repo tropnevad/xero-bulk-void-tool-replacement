@@ -149,23 +149,29 @@ def put_xero_api_call(url, headers, data):
 
 def process_void_job(token, tenant_id, invoice_ids, all_at_once):
     """
-    We either void instantly or wait 1 second inbetween API calls using all_at_once
+    We either void instantly or use adaptive rate limiting with all_at_once
     """
     total_invoices = len(invoice_ids)
     if total_invoices == 0:
         print("No invoices to process.")
         return
 
-    print(f"Starting to process {total_invoices} invoices.")
+    print(f"Starting to process {total_invoices} invoices with adaptive rate limiting (base delay: 1.0s).")
 
     start_time = time.time()
     processed = 0
+    # Adaptive rate limiting variables
+    current_delay = 1.0  # Start with 1 second delay (60 calls/minute)
+    rate_limit_hits = 0
+    max_delay = 10.0  # Maximum delay of 10 seconds
+    # Performance tracking variables
+    fast_voids = 0
+    retry_voids = 0
 
     for idx, invoice_id in enumerate(invoice_ids, start=1):
         if not all_at_once:
-            # Sleep 1.5 seconds to respect rate limit
-            # of 60 API calls max per minute
-            time.sleep(1.5)
+            # Sleep with adaptive delay to respect rate limit
+            time.sleep(current_delay)
         # Calculate ETA before voiding to ensure accurate timing
         elapsed_time = time.time() - start_time
         if processed > 0:
@@ -176,22 +182,48 @@ def process_void_job(token, tenant_id, invoice_ids, all_at_once):
         else:
             eta_formatted = "Calculating..."
 
-        void_invoice(token, tenant_id, invoice_id, processed + 1, total_invoices, eta_formatted)
+        rate_limited = void_invoice(token, tenant_id, invoice_id, processed + 1, total_invoices, eta_formatted)
         processed += 1
+        
+        # Track performance based on return value pattern
+        # rate_limited is True for rate limits, False for success/failure
+        if rate_limited:
+            rate_limit_hits += 1
+            current_delay = min(current_delay * 1.5, max_delay)  # Increase delay by 50%
+            print(f"Rate limit hit! Increasing delay to {current_delay:.1f}s (hit #{rate_limit_hits})")
+        elif hasattr(void_invoice, 'last_result'):
+            if void_invoice.last_result == 'fast_success':
+                fast_voids += 1
+            elif void_invoice.last_result == 'retry_success':
+                retry_voids += 1
+            
+        elif current_delay > 1.0 and rate_limit_hits > 0:
+            # Gradually reduce delay back towards baseline if we haven't hit limits recently
+            current_delay = max(current_delay * 0.95, 1.0)  # Reduce delay by 5%
 
     total_elapsed = time.time() - start_time
     total_formatted = time.strftime("%H:%M:%S", time.gmtime(total_elapsed))
-    print(f"Completed processing {total_invoices} invoices in {total_formatted}.")
+    rate_limit_info = f" (hit rate limit {rate_limit_hits} times)" if rate_limit_hits > 0 else ""
+    performance_info = f" | Fast voids: {fast_voids}, Retry voids: {retry_voids}" if (fast_voids > 0 or retry_voids > 0) else ""
+    api_calls_saved = fast_voids * 2  # Each fast void saves 2 API calls
+    if api_calls_saved > 0:
+        performance_info += f" (Saved {api_calls_saved} API calls!)"
+    print(f"Completed processing {total_invoices} invoices in {total_formatted}{rate_limit_info}{performance_info}.")
 
 
 def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatted):
     """
-    Voids a given invoice number
+    Voids a given invoice number using optimized approach:
+    1. Try direct void first (fast path)
+    2. Only do full lookup if void fails (slow path for error handling)
     """
     try:
-        print(f"Asking Xero to void {invoice_number}")
+        print(f"Attempting to void {invoice_number}")
         
-        # 1) Find the invoice by number
+        # FAST PATH: Try to find invoice and attempt direct void first
+        # This avoids expensive lookups for invoices that void successfully
+        
+        # 1) Find the invoice by number (only lookup we need for InvoiceID)
         import urllib.parse
         encoded_invoice_number = urllib.parse.quote(invoice_number)
         get_list_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}?where=InvoiceNumber==\"{encoded_invoice_number}\""
@@ -202,29 +234,66 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
         }
         
         list_res = requests.get(get_list_url, headers=get_headers)
-        if list_res.status_code != 200:
+        if list_res.status_code == 429:
+            print(f"Rate limit exceeded while searching for {invoice_number}")
+            return True  # Signal rate limit hit
+        elif list_res.status_code != 200:
             print(f"Failed to retrieve invoice list for {invoice_number}: {list_res.status_code}")
             print(f"Response: {list_res.text}")
             print(f"Skipping this invoice and continuing with others...")
-            return
+            return False
 
         data = list_res.json()
         if not data.get('Invoices'):
             print(f"No invoice found with number {invoice_number}")
             print(f"Skipping this invoice and continuing with others...")
-            return
+            return False
 
         invoice_id = data['Invoices'][0]['InvoiceID']
         print(f"Found invoice {invoice_number} with ID {invoice_id}")
 
-        # 2) Fetch full invoice details
+        # 2) Try FAST void with minimal data first
+        print(f"Attempting fast void for {invoice_number}")
+        void_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}"
+        void_headers = {
+            'Accept': 'application/json',
+            'Authorization': f"Bearer {token}",
+            'xero-tenant-id': tenant_id,
+            'Content-Type': 'application/json'
+        }
+        
+        # Minimal void payload - fastest path
+        fast_void_payload = {
+            "Invoices": [{
+                "InvoiceID": invoice_id,
+                "Status": "VOIDED"
+            }]
+        }
+        
+        void_res = post_xero_api_call(void_url, void_headers, fast_void_payload)
+        if void_res.status_code == 429:
+            print(f"Rate limit exceeded while voiding {invoice_number}")
+            return True  # Signal rate limit hit
+        elif void_res.status_code in (200, 204):
+            print(f"✓ Fast void successful! {invoice_number} voided. ({processed}/{total}) ETA remaining: {eta_formatted}")
+            void_invoice.last_result = 'fast_success'
+            return False  # Success, no rate limit
+        
+        # SLOW PATH: Fast void failed, get full details and retry with complete data
+        print(f"Fast void failed for {invoice_number}, getting full details to retry...")
+        print(f"Fast void error: {void_res.status_code} - {void_res.text}")
+        
+        # 3) Fetch full invoice details for retry
         get_full_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}/{invoice_id}"
         full_res = requests.get(get_full_url, headers=get_headers)
-        if full_res.status_code != 200:
+        if full_res.status_code == 429:
+            print(f"Rate limit exceeded while fetching details for {invoice_number}")
+            return True  # Signal rate limit hit
+        elif full_res.status_code != 200:
             print(f"Failed to retrieve full details for {invoice_number}: {full_res.status_code}")
             print(f"Response: {full_res.text}")
             print(f"Skipping this invoice and continuing with others...")
-            return
+            return False
 
         invoice = full_res.json()['Invoices'][0]
         current_status = invoice.get('Status', 'UNKNOWN')
@@ -232,9 +301,10 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
 
         if current_status == 'VOIDED':
             print(f"{invoice_number} already voided; skipping.")
-            return
+            return False
 
-        # 3) Void via update endpoint
+        # 4) Retry void with complete invoice data
+        print(f"Retrying void for {invoice_number} with complete data...")
         # Use the exact invoice data from the API response to avoid rounding errors
         void_url = f"https://api.xero.com/api.xro/2.0/{VOID_TYPE}"
         void_headers = {
@@ -274,8 +344,13 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
         }
         
         void_res = post_xero_api_call(void_url, void_headers, void_payload)
-        if void_res.status_code in (200, 204):
-            print(f"Voided {invoice_number} successfully! ({processed}/{total}) ETA remaining: {eta_formatted}")
+        if void_res.status_code == 429:
+            print(f"Rate limit exceeded while voiding {invoice_number}")
+            return True  # Signal rate limit hit
+        elif void_res.status_code in (200, 204):
+            print(f"✓ Retry void successful! {invoice_number} voided with complete data. ({processed}/{total}) ETA remaining: {eta_formatted}")
+            void_invoice.last_result = 'retry_success'
+            return False  # Success, no rate limit
         else:
             print(f"Failed to void {invoice_number}: {void_res.status_code}")
             print(f"Response: {void_res.text}")
@@ -369,18 +444,19 @@ def void_invoice(token, tenant_id, invoice_number, processed, total, eta_formatt
                 print(f"Error processing response: {str(e)}")
                 print(f"Response text: {void_res.text}")
             print(f"Failed to void {invoice_number}. ({processed}/{total}) ETA remaining: {eta_formatted}")
+            return False  # Failed but no rate limit
     except requests.exceptions.RequestException as e:
         print(f"Network error processing invoice {invoice_number}: {str(e)}")
         print(f"Skipping {invoice_number} and continuing with the next invoice.")
-        return
+        return False
     except json.JSONDecodeError as e:
         print(f"JSON decode error processing invoice {invoice_number}: {str(e)}")
         print(f"Skipping {invoice_number} and continuing with the next invoice.")
-        return
+        return False
     except Exception as e:
         print(f"Unexpected error processing invoice {invoice_number}: {str(e)}")
         print(f"Skipping {invoice_number} and continuing with the next invoice.")
-        return
+        return False
 
 def main():
     """
